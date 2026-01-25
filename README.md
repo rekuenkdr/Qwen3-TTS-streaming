@@ -1352,4 +1352,10 @@ If you find our paper and code useful in your research, please consider giving a
 }
 ```
 
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=QwenLM/Qwen3-TTS&type=Date)](https://star-history.com/#QwenLM/Qwen3-TTS&Date)
+
+
 <br>

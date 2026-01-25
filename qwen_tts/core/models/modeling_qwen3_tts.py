@@ -519,7 +519,7 @@ class Qwen3TTSPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen3TTSDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
     _supports_static_cache = False
@@ -550,8 +550,7 @@ class Qwen3TTSTalkerTextPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = []
     _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn_3 = True
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
     _supports_cache_class = True
@@ -1918,6 +1917,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         weights_only=True,
         **kwargs,
     ):
+        # Hotfix to enable passing the correct attn implementation which is stored in the config but not in kwargs
+        requested_attn_implementation = kwargs.pop("attn_implementation", None)
+        if requested_attn_implementation is None and config and config._attn_implementation:
+            requested_attn_implementation = config._attn_implementation
+
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
@@ -1930,6 +1934,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             revision=revision,
             use_safetensors=use_safetensors,
             weights_only=weights_only,
+            attn_implementation=requested_attn_implementation,
             **kwargs,
         )
         if not local_files_only and not os.path.isdir(pretrained_model_name_or_path):
