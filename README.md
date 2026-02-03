@@ -51,10 +51,9 @@ Streaming TTS can produce clicks, pops, and artifacts at chunk boundaries. This 
 Chunks are blended using a Hann window crossfade to eliminate boundary discontinuities:
 
 ```python
-MIN_BLEND_SAMPLES = 512  # ~21ms at 24kHz
-
-# blend_samples is at least MIN_BLEND_SAMPLES, even if overlap_samples is smaller
-blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+# ~21ms at 24kHz, matches RMS check window
+# Lower values may cause clicks, set to 0 to disable
+DEFAULT_BLEND_SAMPLES = 512
 
 # Hann crossfade
 fade_out = 0.5 * (1 + np.cos(np.pi * t))
@@ -161,7 +160,7 @@ for chunk, sr in model.stream_generate_voice_clone(
 |-----------|---------|-------------|
 | `emit_every_frames` | 8 | Emit audio every N frames |
 | `decode_window_frames` | 80 | Decoder context window |
-| `overlap_samples` | 512 | Crossfade overlap between chunks |
+| `overlap_samples` | 512 | Crossfade overlap between chunks (0 to disable) |
 | `max_frames` | 10000 | Maximum codec frames to generate |
 | `first_chunk_emit_every` | 0 | Phase 1 emit interval (0 = disabled) |
 | `first_chunk_decode_window` | 48 | Phase 1 decode window |

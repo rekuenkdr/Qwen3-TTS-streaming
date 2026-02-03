@@ -103,9 +103,10 @@ def _crossfade(prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
     return prev_tail[:n] * fade_out + new_head[:n] * fade_in
 
 
-# Minimum samples for boundary blending (prevents clicks even with overlap_samples=0)
+# Default blend samples for boundary blending
 # ~21ms at 24kHz, matches RMS check window for better coverage
-MIN_BLEND_SAMPLES = 512
+# Lower values may cause clicks, set to 0 to disable
+DEFAULT_BLEND_SAMPLES = 512
 
 
 def _add_ref_code_context(
@@ -2814,7 +2815,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Crossfade with previous chunk tail for smooth transition
             # Always blend boundaries to prevent clicks from sliding window re-decode artifacts
-            blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+            blend_samples = overlap_samples
             if decoded_tail is not None:
                 ov = min(blend_samples, len(decoded_tail), len(chunk))
                 if ov > 0:
@@ -2823,7 +2824,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Apply Hann fade-in to very first chunk to avoid pop at audio start
             # Always apply fade-in on first chunk to prevent pop
-            blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+            blend_samples = overlap_samples
             if decoded_tail is None:
                 fade_len = min(blend_samples, len(chunk))
                 if fade_len > 0:
@@ -2867,7 +2868,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Crossfade with previous tail
             # Always blend flush boundary
-            blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+            blend_samples = overlap_samples
             if decoded_tail is not None and len(wav) > 0:
                 ov = min(blend_samples, len(decoded_tail), len(wav))
                 if ov > 0:
