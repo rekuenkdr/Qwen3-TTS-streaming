@@ -14,6 +14,7 @@ Added in this fork:
 - **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
 - **Multiple EOS token detection** - broader termination coverage for reliable generation stopping
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
+- **Batch streaming** - process multiple texts in a single batched transformer pass with `batch_stream_generate_voice_clone()`, with per-item state management and independent EOS detection
 
 ## Two-Phase Streaming
 
@@ -155,6 +156,46 @@ for chunk, sr in model.stream_generate_voice_clone(
     sd.play(chunk, sr)
     sd.wait()
 ```
+
+## Batch Streaming
+
+Generate audio for multiple texts in a single batched pass through the transformer. All items advance in lockstep, sharing the KV cache. A single voice prompt can be broadcast to all items, or you can pass one per item.
+
+```python
+import numpy as np
+import soundfile as sf
+
+# Batch of texts (same voice prompt broadcast to all)
+texts = [
+    "First sentence to synthesize.",
+    "Second sentence, different text.",
+    "Third sentence in the batch.",
+]
+
+# Accumulate per-item chunks
+item_chunks = [[] for _ in range(len(texts))]
+
+for chunks_list, sr in model.batch_stream_generate_voice_clone(
+    text=texts,
+    language="English",              # broadcast to all items
+    voice_clone_prompt=prompt,       # broadcast to all items
+    emit_every_frames=8,
+    decode_window_frames=80,
+    first_chunk_emit_every=5,
+    first_chunk_decode_window=48,
+    first_chunk_frames=48,
+):
+    for i, chunk in enumerate(chunks_list):
+        if chunk.size > 0:
+            item_chunks[i].append(chunk)
+
+# Save each item
+for i, chunks in enumerate(item_chunks):
+    if chunks:
+        sf.write(f"output_{i}.wav", np.concatenate(chunks), sr)
+```
+
+Items finish independently (per-item EOS detection), but the generator keeps yielding until all items are done. Finished items receive empty arrays.
 
 ## Parameters
 
