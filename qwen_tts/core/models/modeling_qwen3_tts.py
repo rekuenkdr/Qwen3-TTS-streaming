@@ -2625,6 +2625,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         # Repetition penalty
         repetition_penalty: float = 1.0,
+        repetition_penalty_window: int = 100,
         # Streaming control
         emit_every_frames: int = 8,
         decode_window_frames: int = 80,
@@ -2653,6 +2654,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             top_p: Top-p (nucleus) filtering for sampling
             temperature: Sampling temperature
             subtalker_*: Parameters for sub-codebook prediction
+            repetition_penalty: Penalty factor for previously generated tokens (1.0 = disabled)
+            repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
+                Codec models reuse tokens heavily; unlimited tracking starves the vocabulary.
             emit_every_frames: Emit PCM chunk every N codec frames
             decode_window_frames: Window size for decoding (longer = better quality, more latency)
             overlap_samples: Overlap samples for crossfade between chunks
@@ -2729,7 +2733,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
         else:
             token = torch.argmax(last_logits, dim=-1)
-        # Debug removed for performance: first token sampled
 
         # Extract ref_code for decoder context (if in ICL mode)
         # This provides stable context from the start, eliminating early voice artifacts
@@ -2748,7 +2751,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         decoded_tail: Optional[np.ndarray] = None
         frames_since_emit = 0
         total_frames_emitted = 0  # Track how many frames we've already emitted audio for
-        generated_token_ids: list[int] = []  # Track first-codebook tokens for repetition penalty
+        generated_token_ids: list[int] = [token.item()]  # Track first-codebook tokens for repetition penalty
 
         for step_idx in range(max_frames):
             # Mark step begin for CUDA graphs to avoid tensor overwrite errors
@@ -2791,9 +2794,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Sample next token for first codebook
             step_logits = step_out.logits[:, -1, :]
 
-            # Apply repetition penalty to previously generated tokens
+            # Apply repetition penalty to recently generated tokens (windowed)
             if repetition_penalty != 1.0 and len(generated_token_ids) > 0:
-                prev_ids = torch.tensor(list(set(generated_token_ids)), device=step_logits.device)
+                recent = generated_token_ids[-repetition_penalty_window:] if repetition_penalty_window > 0 else generated_token_ids
+                prev_ids = torch.tensor(list(set(recent)), device=step_logits.device)
                 scores = torch.gather(step_logits[0], 0, prev_ids)
                 scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
                 step_logits[0].scatter_(0, prev_ids, scores)
@@ -2948,6 +2952,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         # Repetition penalty
         repetition_penalty: float = 1.0,
+        repetition_penalty_window: int = 100,
         # Streaming control
         emit_every_frames: int = 8,
         decode_window_frames: int = 80,
@@ -2980,7 +2985,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             top_p: Top-p (nucleus) filtering for sampling
             temperature: Sampling temperature
             subtalker_*: Parameters for sub-codebook prediction
-            repetition_penalty: Penalty to reduce repeated tokens/codes
+            repetition_penalty: Penalty factor for previously generated tokens (1.0 = disabled)
+            repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited)
             emit_every_frames: Emit PCM chunk every N codec frames (phase 2)
             decode_window_frames: Window size for decoding (phase 2)
             overlap_samples: Overlap samples for crossfade between chunks
@@ -3071,7 +3077,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         codes_buffers: list[list[torch.Tensor]] = [[] for _ in range(B)]
         decoded_tails: list[Optional[np.ndarray]] = [None] * B
         total_frames_emitted: list[int] = [0] * B
-        generated_token_ids: list[list[int]] = [[] for _ in range(B)]
+        generated_token_ids: list[list[int]] = [[token[b].item()] for b in range(B)]
         finished: list[bool] = [False] * B
         sr = 24000  # default sample rate, updated on first decode
 
@@ -3124,7 +3130,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 for b in range(B):
                     if finished[b] or len(generated_token_ids[b]) == 0:
                         continue
-                    prev_ids = torch.tensor(list(set(generated_token_ids[b])), device=step_logits.device)
+                    recent = generated_token_ids[b][-repetition_penalty_window:] if repetition_penalty_window > 0 else generated_token_ids[b]
+                    prev_ids = torch.tensor(list(set(recent)), device=step_logits.device)
                     scores = torch.gather(step_logits[b], 0, prev_ids)
                     scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
                     step_logits[b].scatter_(0, prev_ids, scores)

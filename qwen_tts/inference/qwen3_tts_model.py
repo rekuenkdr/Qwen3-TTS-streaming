@@ -704,6 +704,10 @@ class Qwen3TTSModel:
         first_chunk_emit_every: int = 0,  # 0 = disabled, use emit_every_frames throughout
         first_chunk_decode_window: int = 48,
         first_chunk_frames: int = 48,  # Switch to stable after this many frames
+        # Repetition penalty window
+        repetition_penalty_window: int = 100,
+        # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
+        repetition_penalty: float = 1.0,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -728,6 +732,9 @@ class Qwen3TTSModel:
             first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled).
             first_chunk_decode_window: Decode window size for first chunk phase.
             first_chunk_frames: Switch to stable settings after this many frames.
+            repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
+            repetition_penalty: Repetition penalty factor (1.0 = disabled). Disabled by default
+                for streaming to avoid vocabulary starvation with the small codec vocabulary.
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -787,10 +794,11 @@ class Qwen3TTSModel:
         # Extract streaming params, filter to only supported ones
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         # Only keep params supported by stream_generate_pcm
+        # Note: repetition_penalty is passed as an explicit arg, not through gen_kwargs,
+        # so _merge_generate_kwargs' default (1.05) doesn't override our streaming default (1.0)
         supported_params = {
             "do_sample", "top_k", "top_p", "temperature",
             "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
-            "repetition_penalty"
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
 
@@ -809,6 +817,8 @@ class Qwen3TTSModel:
             first_chunk_emit_every=first_chunk_emit_every,
             first_chunk_decode_window=first_chunk_decode_window,
             first_chunk_frames=first_chunk_frames,
+            repetition_penalty=repetition_penalty,
+            repetition_penalty_window=repetition_penalty_window,
             **gen_kwargs,
         ):
             yield chunk, sr
@@ -831,6 +841,10 @@ class Qwen3TTSModel:
         first_chunk_emit_every: int = 0,
         first_chunk_decode_window: int = 48,
         first_chunk_frames: int = 48,
+        # Repetition penalty window
+        repetition_penalty_window: int = 100,
+        # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
+        repetition_penalty: float = 1.0,
         **kwargs,
     ) -> Generator[Tuple[List[np.ndarray], int], None, None]:
         """
@@ -853,6 +867,9 @@ class Qwen3TTSModel:
             first_chunk_emit_every: Emit interval for phase 1 (0 = disabled).
             first_chunk_decode_window: Decode window for phase 1.
             first_chunk_frames: Switch to phase 2 after this many frames.
+            repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
+            repetition_penalty: Repetition penalty factor (1.0 = disabled). Disabled by default
+                for streaming to avoid vocabulary starvation with the small codec vocabulary.
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -915,11 +932,11 @@ class Qwen3TTSModel:
                     ref_ids.append(ref_tok)
 
         # Filter to supported generation params
+        # Note: repetition_penalty is passed as an explicit arg, not through gen_kwargs
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         supported_params = {
             "do_sample", "top_k", "top_p", "temperature",
             "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
-            "repetition_penalty"
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
 
@@ -938,6 +955,8 @@ class Qwen3TTSModel:
             first_chunk_emit_every=first_chunk_emit_every,
             first_chunk_decode_window=first_chunk_decode_window,
             first_chunk_frames=first_chunk_frames,
+            repetition_penalty=repetition_penalty,
+            repetition_penalty_window=repetition_penalty_window,
             **gen_kwargs,
         ):
             yield chunks_list, sr

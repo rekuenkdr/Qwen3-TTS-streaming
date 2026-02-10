@@ -1056,11 +1056,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         B, Q, T = codes.shape
 
         if T < target_length:
-            # Pad with zeros on the left
-            pad = torch.zeros(B, Q, target_length - T, dtype=codes.dtype, device=codes.device)
+            # Pad with -1 on the left (0 is a valid codebook entry)
+            pad = torch.full((B, Q, target_length - T), -1, dtype=codes.dtype, device=codes.device)
             codes_padded = torch.cat([pad, codes], dim=-1)
         else:
             codes_padded = codes.contiguous()  # Ensure uniform tensor format to avoid recompilation
+
+        # Clamp padding to valid range before decoding (codebook indices must be >= 0)
+        codes_padded = torch.clamp(codes_padded, min=0)
 
         # Run forward (uses compiled path if available)
         wav = self.forward_optimized(codes_padded)
