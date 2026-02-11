@@ -11,9 +11,9 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 
 Added in this fork:
 - **Two-phase streaming** - faster first-chunk latency
-- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
+- **Async CUDA stream decoding** - overlaps AR token generation with speech decoding on a separate CUDA stream for improved streaming throughput
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
-- **Batch generation** - process multiple texts in a single forward pass with `generate_voice_clone(text=List[str])` for ~2.6x speedup over sequential
+- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
 - **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
 
 ## Installation
@@ -68,73 +68,6 @@ for chunk, sr in model.stream_generate_voice_clone(
     sd.wait()
 ```
 
-## Batch Generation
-
-Generate audio for multiple texts in a single forward pass. Pass a list of strings to `generate_voice_clone()` — a single voice prompt broadcasts to all items automatically.
-
-```python
-import soundfile as sf
-
-texts = [
-    (
-        "The development of artificial intelligence has transformed nearly every aspect of "
-        "modern life, from the way we communicate with one another to the fundamental nature "
-        "of work itself. Machine learning algorithms now power recommendation systems that "
-        "curate our news feeds, voice assistants that manage our daily schedules, and "
-        "autonomous vehicles that navigate complex urban environments. Yet despite these "
-        "remarkable advances, the field continues to grapple with profound questions about "
-        "bias, transparency, and the ethical implications of delegating critical decisions "
-        "to automated systems that operate in ways their creators do not fully understand."
-    ),
-
-    (
-        "Throughout history, technological revolutions have always been accompanied by "
-        "periods of significant social disruption and adaptation. The industrial revolution "
-        "displaced millions of agricultural workers, but eventually created entirely new "
-        "categories of employment that no one could have predicted. Similarly, the digital "
-        "revolution of the late twentieth century eliminated countless clerical and "
-        "manufacturing positions while simultaneously giving rise to the software industry, "
-        "e-commerce, and the gig economy. The current wave of artificial intelligence "
-        "promises to follow a comparable pattern, though the speed and scale of disruption "
-        "may exceed anything we have experienced before."
-    ),
-
-    (
-        "Looking ahead, the most transformative applications of artificial intelligence "
-        "are likely to emerge not from any single breakthrough, but from the convergence of "
-        "multiple technologies working in concert. Large language models combined with "
-        "robotics could revolutionize healthcare delivery in underserved communities. "
-        "Computer vision paired with satellite imagery and climate models could provide "
-        "early warning systems for natural disasters with unprecedented accuracy. And "
-        "generative AI tools are already enabling artists, musicians, and writers to explore "
-        "creative possibilities that were previously unimaginable, raising fascinating "
-        "questions about the nature of authorship and artistic expression in an age of "
-        "human-machine collaboration."
-    ),
-]
-
-# Single call returns a list of (wav_array, sample_rate) tuples
-results = model.generate_voice_clone(
-    text=texts,
-    language="en",
-    voice_clone_prompt=prompt,       # broadcast to all items
-)
-
-for i, (wav, sr) in enumerate(results):
-    sf.write(f"output_{i}.wav", wav, sr)
-```
-
-**Benchmarks** (Qwen3-TTS-12Hz-1.7B-Base, RTX 5060 Ti 16GB, 3 paragraphs, emit every 12 frames, decode window 80 frames):
-
-| Metric | Sequential | Batch | Speedup |
-|--------|-----------|-------|---------|
-| Total time | 54.06s | 20.44s | **2.64x** |
-| Audio generated | 104.80s | 106.24s | — |
-| Throughput | 1.94x | 5.20x | — |
-| RTF | 0.516 | 0.192 | — |
-
-Batch streaming (`batch_stream_generate_voice_clone()`) is also available for incremental chunk delivery, but has higher TTFB (~8.6s) due to lockstep prefill — prefer non-streaming batch for offline/buffered workloads.
-
 ## Streaming Parameters
 
 | Parameter | Default | Description |
@@ -177,6 +110,34 @@ User hears audio **362ms earlier** vs baseline, **174ms earlier** vs only optimi
 - vs Baseline: **2.75x faster** (570ms → 208ms, saves 362ms)
 - vs Optimized: **1.87x faster** (389ms → 208ms, saves 181ms)
 - vs Optimized_2: **1.84x faster** (382ms → 208ms, saves 174ms)
+
+## Async CUDA Stream Decoding
+
+Without async decode, each streaming step is serial: the AR model generates codec tokens, then blocks while the speech decoder converts them to audio. The AR model sits idle during decode.
+
+With `async_decode=True`, speech decoding runs on a separate CUDA stream. After accumulating enough codec frames, the decode is launched non-blocking on the decode stream while the AR model immediately continues generating the next tokens on the default stream. A CUDA event signals when the decode finishes, and the result is yielded at the start of the next emit cycle.
+
+```
+Without async (serial):
+
+  Default Stream: [AR tokens]──[Decode]──wait──[AR tokens]──[Decode]──wait──
+                                         ^^^^                        ^^^^
+                                         idle                        idle
+
+With async_decode=True (pipelined):
+
+  Default Stream: [AR tokens]──[AR tokens]──[AR tokens]──[AR tokens]──
+                        │            │            │
+                   event│       event│       event│
+                        ▼            ▼            ▼
+  Decode Stream:   [  Decode  ]──[  Decode  ]──[  Decode  ]──
+                             │            │
+                        yield│       yield│
+                             ▼            ▼
+  Output:               chunk 1      chunk 2      ...
+```
+
+
 
 ## Audio Quality Fixes
 
