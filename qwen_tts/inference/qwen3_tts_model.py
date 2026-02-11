@@ -857,11 +857,10 @@ class Qwen3TTSModel:
         and ref_code context.
 
         .. note::
-            Benchmarks show non-streaming batch (``generate_voice_clone(text=List[str])``)
-            achieves higher throughput (5.2x vs 4.3x) with much lower latency. Batch streaming
-            has high TTFB (~8.6s for 3 paragraphs) due to lockstep prefill. Prefer non-streaming
-            batch for offline/buffered generation. Reserve this method for cases requiring
-            incremental chunk delivery of multiple items simultaneously.
+            Lockstep prefill means all items must complete prefill before any chunks
+            stream, resulting in high TTFB that grows with the longest text in the batch.
+            For offline/buffered workloads, ``generate_voice_clone(text=List[str])``
+            returns full audio directly with higher throughput.
 
         Args:
             text: List of texts to synthesize (one per batch item).

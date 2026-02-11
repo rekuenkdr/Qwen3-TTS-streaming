@@ -3099,13 +3099,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         maintained for codes buffers, decoded tails, repetition penalty tracking,
         ref_code contexts, and EOS detection.
 
-        .. note::
-            Benchmarks show non-streaming batch (``generate_voice_clone(text=List[str])``)
-            achieves higher throughput (5.2x vs 4.3x) with much lower latency. Batch streaming
-            has high TTFB (~8.6s for 3 paragraphs) due to lockstep prefill. Prefer non-streaming
-            batch for offline/buffered generation. Reserve this method for cases requiring
-            incremental chunk delivery of multiple items simultaneously.
-
         Args:
             input_ids: List of input token tensors (one per batch item)
             instruct_ids: Optional instruction token tensors
