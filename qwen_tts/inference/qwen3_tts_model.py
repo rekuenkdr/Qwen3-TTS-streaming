@@ -708,6 +708,8 @@ class Qwen3TTSModel:
         repetition_penalty_window: int = 100,
         # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
         repetition_penalty: float = 1.0,
+        # Async decode: overlap AR generation with speech decoding on separate CUDA streams
+        async_decode: bool = False,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -735,6 +737,8 @@ class Qwen3TTSModel:
             repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
             repetition_penalty: Repetition penalty factor (1.0 = disabled). Disabled by default
                 for streaming to avoid vocabulary starvation with the small codec vocabulary.
+            async_decode: If True, overlap AR token generation with speech decoding on separate
+                CUDA streams for improved throughput (~1.4x).
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -819,6 +823,7 @@ class Qwen3TTSModel:
             first_chunk_frames=first_chunk_frames,
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
+            async_decode=async_decode,
             **gen_kwargs,
         ):
             yield chunk, sr
@@ -845,6 +850,8 @@ class Qwen3TTSModel:
         repetition_penalty_window: int = 100,
         # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
         repetition_penalty: float = 1.0,
+        # Async decode: overlap AR generation with speech decoding on separate CUDA streams
+        async_decode: bool = False,
         # Batch compaction: remove finished items from GPU tensors
         compact_finished: bool = False,
         **kwargs,
@@ -878,6 +885,8 @@ class Qwen3TTSModel:
             repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
             repetition_penalty: Repetition penalty factor (1.0 = disabled). Disabled by default
                 for streaming to avoid vocabulary starvation with the small codec vocabulary.
+            async_decode: If True, overlap AR token generation with speech decoding on separate
+                CUDA streams for improved throughput (~1.4x).
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -966,6 +975,7 @@ class Qwen3TTSModel:
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
             compact_finished=compact_finished,
+            async_decode=async_decode,
             **gen_kwargs,
         ):
             yield chunks_list, sr
