@@ -834,7 +834,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._static_input: Optional[torch.Tensor] = None
         self._static_output: Optional[torch.Tensor] = None
         self._graph_window_size: Optional[int] = None
-        
+
+        # Async CUDA graph state (private pool, safe for non-default streams)
+        self._async_pool: Optional[int] = None
+        self._async_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._async_static_input: Optional[torch.Tensor] = None
+        self._async_static_output: Optional[torch.Tensor] = None
+        self._async_window_size: Optional[int] = None
+
         self.quantizer = SplitResidualVectorQuantizer(
             dimension=config.codebook_dim // 2,
             n_q=config.num_quantizers,
@@ -1007,6 +1014,47 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         print("[Decoder] CUDA graph captured successfully")
         return self
 
+    def capture_async_cuda_graph(self, window_size: int = 80, warmup_runs: int = 3):
+        """Capture CUDA graph with private pool for async decode on non-default streams.
+
+        Unlike torch.compile(reduce-overhead), manual CUDA graphs with a private pool
+        can safely replay concurrently with other CUDA graphs on different streams.
+        Uses _forward_impl (raw forward) — no cudagraph_mark_step_begin() interference.
+        """
+        if not torch.cuda.is_available():
+            return self
+
+        device = next(self.parameters()).device
+        num_quantizers = self.config.num_quantizers
+
+        # Private pool: memory isolated from reduce-overhead internal pools
+        self._async_pool = torch.cuda.graph_pool_handle()
+        self._async_window_size = window_size
+
+        self._async_static_input = torch.zeros(
+            1, num_quantizers, window_size, dtype=torch.long, device=device
+        )
+
+        forward_fn = self._forward_impl
+
+        # Warmup
+        print(f"[Decoder] Warming up async CUDA graph (window_size={window_size})...")
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(warmup_runs):
+                _ = forward_fn(self._async_static_input)
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture with private pool
+        print("[Decoder] Capturing async CUDA graph (private pool)...")
+        self._async_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._async_graph, pool=self._async_pool):
+            self._async_static_output = forward_fn(self._async_static_input)
+
+        print("[Decoder] Async CUDA graph captured successfully")
+        return self
+
     def forward_optimized(self, codes):
         """
         Forward pass with optimizations if available.
@@ -1076,6 +1124,61 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             trim_samples = int((target_length - T) * samples_per_frame)
             wav = wav[..., trim_samples:]
 
+        return wav
+
+    def decode_padded_async(self, codes: torch.Tensor, target_length: int) -> torch.Tensor:
+        """Decode with padding using the async CUDA graph (private pool, stream-safe).
+
+        Same padding logic as decode_padded, but replays the async graph
+        instead of forward_optimized. Safe for non-default CUDA streams.
+        """
+        if self._async_graph is None:
+            # Fallback: raw forward (no CUDA graph, still stream-safe)
+            return self.decode_padded_eager(codes, target_length)
+
+        B, Q, T = codes.shape
+
+        # Async graph captured with B=1 static shape; fall back to eager for batches
+        if B != 1:
+            return self.decode_padded_eager(codes, target_length)
+
+        if T < target_length:
+            pad = torch.full((B, Q, target_length - T), -1, dtype=codes.dtype, device=codes.device)
+            codes_padded = torch.cat([pad, codes], dim=-1)
+        else:
+            codes_padded = codes.contiguous()
+
+        codes_padded = torch.clamp(codes_padded, min=0)
+
+        self._async_static_input.copy_(codes_padded)
+        self._async_graph.replay()
+
+        # Trim left-padding from output
+        if T < target_length:
+            total_samples = self._async_static_output.shape[-1]
+            samples_per_frame = total_samples / target_length
+            trim_samples = int((target_length - T) * samples_per_frame)
+            return self._async_static_output[..., trim_samples:].clone()
+        return self._async_static_output.clone()
+
+    def decode_padded_eager(self, codes: torch.Tensor, target_length: int) -> torch.Tensor:
+        """Decode with padding using raw forward (no CUDA graphs). Fallback for async."""
+        B, Q, T = codes.shape
+
+        if T < target_length:
+            pad = torch.full((B, Q, target_length - T), -1, dtype=codes.dtype, device=codes.device)
+            codes_padded = torch.cat([pad, codes], dim=-1)
+        else:
+            codes_padded = codes.contiguous()
+
+        codes_padded = torch.clamp(codes_padded, min=0)
+        wav = self._forward_impl(codes_padded)
+
+        if T < target_length:
+            total_samples = wav.shape[-1]
+            samples_per_frame = total_samples / target_length
+            trim_samples = int((target_length - T) * samples_per_frame)
+            wav = wav[..., trim_samples:]
         return wav
 
 
@@ -1255,6 +1358,10 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
             else:
                 self.decoder.capture_cuda_graph(window_size=decode_window_frames)
 
+        # Capture async CUDA graph for decode on non-default streams
+        # Uses private pool — safe for concurrent replay with reduce-overhead graphs
+        self.decoder.capture_async_cuda_graph(window_size=decode_window_frames)
+
         return self
 
     def decode_streaming(
@@ -1262,6 +1369,7 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
         audio_codes: torch.Tensor,
         use_optimized: bool = True,
         pad_to_size: Optional[int] = None,
+        use_async_graph: bool = False,
     ) -> torch.Tensor:
         """
         Decode audio codes optimized for streaming (single window).
@@ -1278,6 +1386,8 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
             pad_to_size: If specified, pad input to this size (in frames) for
                         consistent torch.compile behavior. Should match
                         decode_window_frames for streaming.
+            use_async_graph: If True, use the async CUDA graph (private pool,
+                        safe for non-default streams). Requires pad_to_size.
 
         Returns:
             Waveform tensor [B, samples]
@@ -1285,7 +1395,9 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
         # Transpose to [B, num_quantizers, T] for decoder
         codes = audio_codes.transpose(1, 2)
 
-        if use_optimized:
+        if use_async_graph and pad_to_size is not None:
+            wav = self.decoder.decode_padded_async(codes, pad_to_size)
+        elif use_optimized:
             if pad_to_size is not None:
                 wav = self.decoder.decode_padded(codes, pad_to_size)
             else:

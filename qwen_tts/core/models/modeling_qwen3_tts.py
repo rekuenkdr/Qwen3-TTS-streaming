@@ -2948,20 +2948,25 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                         pending_decode = None
                         yield chunk, sample_rate
 
-                    # Record: default stream finished writing codes_buffer snapshot
+                    # Prepare batched input for inner model decode
+                    codes_batched = window.unsqueeze(0).to(self.talker.device).clone()
+
+                    # Record AFTER codes_batched creation — ensures decode_stream
+                    # waits until the default stream has finished populating codes_batched
                     input_ready = torch.cuda.Event()
                     input_ready.record()
 
-                    # Prepare batched input for inner model decode
-                    codes_batched = window.unsqueeze(0).to(self.talker.device).clone()
+                    # Tell the allocator that codes_batched is also used by decode_stream —
+                    # prevents premature memory reuse before decode_stream finishes reading it
+                    codes_batched.record_stream(decode_stream)
 
                     # Launch GPU decode on decode_stream (non-blocking from Python)
                     decode_stream.wait_event(input_ready)
                     with torch.cuda.stream(decode_stream):
                         wav_gpu = self.speech_tokenizer.model.decode_streaming(
                             codes_batched,
-                            use_optimized=current_use_optimized,
-                            pad_to_size=decode_window_frames if current_use_optimized else None,
+                            use_async_graph=True,  # Manual CUDA graph with private pool (stream-safe)
+                            pad_to_size=decode_window_frames,
                         ).clone()  # Detach from CUDA graph output pool before AR step reclaims it
 
                     # Record decode completion and store as pending
@@ -3435,18 +3440,23 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                         pending_decode = None
                         yield chunks_list, sample_rate
 
-                    # Record: default stream finished writing batch_codes
+                    # Prepare input (on default stream)
+                    batch_codes_async = batch_codes.clone()
+
+                    # Record AFTER data is ready — ensures decode_stream waits for clone to complete
                     input_ready = torch.cuda.Event()
                     input_ready.record()
 
+                    # Prevent allocator reuse while decode_stream reads this tensor
+                    batch_codes_async.record_stream(decode_stream)
+
                     # Launch GPU decode on decode_stream (non-blocking from Python)
                     decode_stream.wait_event(input_ready)
-                    batch_codes_async = batch_codes.clone()
                     with torch.cuda.stream(decode_stream):
                         wav_gpu = self.speech_tokenizer.model.decode_streaming(
                             batch_codes_async,
-                            use_optimized=current_use_optimized,
-                            pad_to_size=decode_window_frames if current_use_optimized else None,
+                            use_async_graph=True,
+                            pad_to_size=decode_window_frames,
                         ).clone()  # Detach from CUDA graph output pool
 
                     # Record decode completion and store as pending

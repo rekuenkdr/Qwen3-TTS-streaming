@@ -11,7 +11,7 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 
 Added in this fork:
 - **Two-phase streaming** - faster first-chunk latency
-- **Async CUDA stream decoding** - overlaps AR token generation with speech decoding on a separate CUDA stream for improved streaming throughput
+- **Async CUDA stream decoding (experimental)** - overlaps AR token generation with speech decoding on a separate CUDA stream. Disabled by default
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
 - **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
 - **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
@@ -111,7 +111,13 @@ User hears audio **362ms earlier** vs baseline, **174ms earlier** vs only optimi
 - vs Optimized: **1.87x faster** (389ms → 208ms, saves 181ms)
 - vs Optimized_2: **1.84x faster** (382ms → 208ms, saves 174ms)
 
-## Async CUDA Stream Decoding
+## Async CUDA Stream Decoding (Experimental)
+
+> **Note:** `async_decode` is disabled by default (`False`) and not recommended for production use.
+> Benchmarks show it provides no speedup — 0.95x for B=1 (single stream) and 0.89x for B>1 (batch)
+> on a single GPU. The GPU cannot truly parallelize AR and decode on the same device, so stream
+> management overhead outweighs any theoretical overlap benefit. The feature is retained for
+> experimentation on multi-GPU setups where AR and decode could run on separate devices.
 
 Without async decode, each streaming step is serial: the AR model generates codec tokens, then blocks while the speech decoder converts them to audio. The AR model sits idle during decode.
 
