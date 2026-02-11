@@ -845,6 +845,8 @@ class Qwen3TTSModel:
         repetition_penalty_window: int = 100,
         # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
         repetition_penalty: float = 1.0,
+        # Batch compaction: remove finished items from GPU tensors
+        compact_finished: bool = False,
         **kwargs,
     ) -> Generator[Tuple[List[np.ndarray], int], None, None]:
         """
@@ -853,6 +855,13 @@ class Qwen3TTSModel:
         All batch items advance in lockstep through the transformer.
         Per-item state is maintained for codes, crossfade, repetition penalty,
         and ref_code context.
+
+        .. note::
+            Benchmarks show non-streaming batch (``generate_voice_clone(text=List[str])``)
+            achieves higher throughput (5.2x vs 4.3x) with much lower latency. Batch streaming
+            has high TTFB (~8.6s for 3 paragraphs) due to lockstep prefill. Prefer non-streaming
+            batch for offline/buffered generation. Reserve this method for cases requiring
+            incremental chunk delivery of multiple items simultaneously.
 
         Args:
             text: List of texts to synthesize (one per batch item).
@@ -957,6 +966,7 @@ class Qwen3TTSModel:
             first_chunk_frames=first_chunk_frames,
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
+            compact_finished=compact_finished,
             **gen_kwargs,
         ):
             yield chunks_list, sr

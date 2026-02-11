@@ -11,9 +11,9 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 
 Added in this fork:
 - **Two-phase streaming** - faster first-chunk latency
-- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
+- **Async CUDA stream decoding** - overlaps AR token generation with speech decoding on a separate CUDA stream for improved streaming throughput
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
-- **Batch streaming** - process multiple texts in a single batched transformer pass with `batch_stream_generate_voice_clone()`, with per-item state management and independent EOS detection
+- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
 - **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
 
 ## Installation
@@ -68,46 +68,6 @@ for chunk, sr in model.stream_generate_voice_clone(
     sd.wait()
 ```
 
-## Batch Streaming
-
-Generate audio for multiple texts in a single batched pass through the transformer. All items advance in lockstep, sharing the KV cache. A single voice prompt can be broadcast to all items, or you can pass one per item.
-
-```python
-import numpy as np
-import soundfile as sf
-
-# Batch of texts (same voice prompt broadcast to all)
-texts = [
-    "First sentence to synthesize.",
-    "Second sentence, different text.",
-    "Third sentence in the batch.",
-]
-
-# Accumulate per-item chunks
-item_chunks = [[] for _ in range(len(texts))]
-
-for chunks_list, sr in model.batch_stream_generate_voice_clone(
-    text=texts,
-    language="English",              # broadcast to all items
-    voice_clone_prompt=prompt,       # broadcast to all items
-    emit_every_frames=8,
-    decode_window_frames=80,
-    first_chunk_emit_every=5,
-    first_chunk_decode_window=48,
-    first_chunk_frames=48,
-):
-    for i, chunk in enumerate(chunks_list):
-        if chunk.size > 0:
-            item_chunks[i].append(chunk)
-
-# Save each item
-for i, chunks in enumerate(item_chunks):
-    if chunks:
-        sf.write(f"output_{i}.wav", np.concatenate(chunks), sr)
-```
-
-Items finish independently (per-item EOS detection), but the generator keeps yielding until all items are done. Finished items receive empty arrays.
-
 ## Streaming Parameters
 
 | Parameter | Default | Description |
@@ -150,6 +110,34 @@ User hears audio **362ms earlier** vs baseline, **174ms earlier** vs only optimi
 - vs Baseline: **2.75x faster** (570ms → 208ms, saves 362ms)
 - vs Optimized: **1.87x faster** (389ms → 208ms, saves 181ms)
 - vs Optimized_2: **1.84x faster** (382ms → 208ms, saves 174ms)
+
+## Async CUDA Stream Decoding
+
+Without async decode, each streaming step is serial: the AR model generates codec tokens, then blocks while the speech decoder converts them to audio. The AR model sits idle during decode.
+
+With `async_decode=True`, speech decoding runs on a separate CUDA stream. After accumulating enough codec frames, the decode is launched non-blocking on the decode stream while the AR model immediately continues generating the next tokens on the default stream. A CUDA event signals when the decode finishes, and the result is yielded at the start of the next emit cycle.
+
+```
+Without async (serial):
+
+  Default Stream: [AR tokens]──[Decode]──wait──[AR tokens]──[Decode]──wait──
+                                         ^^^^                        ^^^^
+                                         idle                        idle
+
+With async_decode=True (pipelined):
+
+  Default Stream: [AR tokens]──[AR tokens]──[AR tokens]──[AR tokens]──
+                        │            │            │
+                   event│       event│       event│
+                        ▼            ▼            ▼
+  Decode Stream:   [  Decode  ]──[  Decode  ]──[  Decode  ]──
+                             │            │
+                        yield│       yield│
+                             ▼            ▼
+  Output:               chunk 1      chunk 2      ...
+```
+
+
 
 ## Audio Quality Fixes
 
