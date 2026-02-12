@@ -27,7 +27,7 @@ from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import (create_causal_mask,
@@ -1416,14 +1416,15 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         """
         Fast generation that bypasses HuggingFace's generate() overhead.
 
-        This is ~2-3x faster than using generate() because:
+        Faster than generate() because:
         1. No GenerationMixin overhead (config creation, stopping criteria, etc.)
-        2. Direct forward calls with minimal wrapper logic
-        3. Simple KV-cache management
+        2. Direct forward calls with explicit cache_position (avoids mask recreation)
+        3. Pre-created DynamicCache (avoids per-call allocation)
+        4. Stacked lm_head/embedding lookups via F.linear/F.embedding (if prepared)
 
         Args:
             inputs_embeds: Initial embeddings [B, 2, hidden_size] (past_hidden + first_token_embed)
-            num_codebooks: Number of codebook tokens to generate (typically 7)
+            num_codebooks: Number of codebook tokens to generate (typically 31)
             do_sample: Whether to sample or use greedy decoding
             temperature: Sampling temperature
             top_k: Top-k filtering
@@ -1432,29 +1433,42 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         Returns:
             Generated token IDs [B, num_codebooks]
         """
-        batch_size = inputs_embeds.shape[0]
+        # CUDA graph replay path: copy input, replay, return output
+        if getattr(self, '_has_codebook_cuda_graph', False) and do_sample and top_p >= 1.0:
+            self._cg_inputs_embeds.copy_(inputs_embeds)
+            self._cg_cache.reset()
+            self._cg_graph.replay()
+            return self._cg_output_tokens.clone()
+
         device = inputs_embeds.device
 
         # Project inputs
         inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
 
-        # Prefill: process initial embeddings
+        # Non-graph path: DynamicCache is faster (StaticCache creates full-width masks)
+        past_key_values = DynamicCache()
+
+        # Prefill: process initial 2 tokens with explicit cache_position
+        cache_position = torch.arange(0, inputs_embeds.shape[1], device=device)
         outputs = self.model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
             use_cache=True,
             output_hidden_states=False,
+            cache_position=cache_position,
         )
         past_key_values = outputs.past_key_values
         hidden_states = outputs.last_hidden_state
+        next_pos = inputs_embeds.shape[1]  # 2
 
         # Generate tokens for each codebook
         generated_tokens = []
-        generation_step = 0  # Start from codebook 1 (index 0 in lm_head)
 
         for step in range(num_codebooks):
-            # Get logits for current codebook
-            logits = self.lm_head[step](hidden_states[:, -1, :])  # [B, vocab_size]
+            # Get logits for current codebook — ModuleList dispatch (faster than stacked in non-graph)
+            h = hidden_states[:, -1, :]  # [B, hidden_size]
+            logits = self.lm_head[step](h)  # [B, vocab_size]
 
             # Sample or greedy
             if do_sample and temperature > 0:
@@ -1489,9 +1503,16 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
             if step == num_codebooks - 1:
                 break
 
-            # Get embedding for next step
+            # Get embedding for next step — ModuleList dispatch (stacked weights for CUDA graph only)
             next_embeds = self.model.get_input_embeddings()[step](next_token)
             next_embeds = self.small_to_mtp_projection(next_embeds)
+
+            # Explicit cache_position for this decode step
+            cache_position = torch.tensor([next_pos], device=device)
+            next_pos += 1
+
+            # Mark step begin for CUDA graphs compatibility
+            torch.compiler.cudagraph_mark_step_begin()
 
             # Forward pass for next position
             outputs = self.model(
@@ -1500,6 +1521,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
                 past_key_values=past_key_values,
                 use_cache=True,
                 output_hidden_states=False,
+                cache_position=cache_position,
             )
             past_key_values = outputs.past_key_values
             hidden_states = outputs.last_hidden_state
@@ -1507,17 +1529,165 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         # Concatenate all generated tokens
         return torch.cat(generated_tokens, dim=-1)  # [B, num_codebooks]
 
+    def prepare_fast_weights(self):
+        """
+        Stack lm_head and codec_embedding weights into single tensors for
+        indexed access via F.linear / F.embedding in generate_fast().
+        Eliminates nn.ModuleList dispatch overhead per step.
+        Also creates a reusable StaticCache for fixed-length generation.
+        """
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        # Stack lm_head weights: [num_codebooks, vocab_size, hidden_size]
+        self._stacked_lm_head_weight = torch.stack(
+            [h.weight for h in self.lm_head], dim=0
+        )
+        # Stack codec_embedding weights: [num_codebooks, vocab_size, embedding_dim]
+        self._stacked_codec_embedding_weight = torch.stack(
+            [e.weight for e in self.model.codec_embedding], dim=0
+        )
+
+        # Pre-allocate StaticCache: max_cache_len = 2 (prefill) + 31 (decode) = 33
+        max_cache_len = 2 + (self.config.num_code_groups - 1)
+        self._static_cache = StaticCache(
+            config=self.config,
+            max_batch_size=1,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _generate_fast_inner(self):
+        """
+        Inner loop operating on pre-allocated static buffers.
+        Used for CUDA graph capture. All shapes are fixed.
+        """
+        num_codebooks = self._cg_num_codebooks
+
+        # Project inputs
+        inputs_embeds = self.small_to_mtp_projection(self._cg_inputs_embeds)
+
+        # Prefill
+        cache_position = self._cg_cache_positions[:2]
+        outputs = self.model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            past_key_values=self._cg_cache,
+            use_cache=True,
+            output_hidden_states=False,
+            cache_position=cache_position,
+        )
+        hidden_states = outputs.last_hidden_state
+
+        # 31-step decode loop (unrolled by Python, captured by CUDA graph)
+        for step in range(num_codebooks):
+            h = hidden_states[:, -1, :]
+            logits = F.linear(h, self._stacked_lm_head_weight[step])
+
+            # Sampling with fixed temperature/top_k (baked into graph)
+            logits = logits / self._cg_temperature
+            top_k_val = self._cg_top_k
+            indices_to_remove = logits < torch.topk(logits, top_k_val)[0][..., -1, None]
+            logits = logits.masked_fill(indices_to_remove, float('-inf'))
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            self._cg_output_tokens[:, step:step + 1] = next_token
+
+            if step < num_codebooks - 1:
+                next_embeds = F.embedding(
+                    next_token, self._stacked_codec_embedding_weight[step]
+                )
+                next_embeds = self.small_to_mtp_projection(next_embeds)
+                cache_position = self._cg_cache_positions[step + 2:step + 3]
+
+                outputs = self.model(
+                    input_ids=None,
+                    inputs_embeds=next_embeds,
+                    past_key_values=self._cg_cache,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    cache_position=cache_position,
+                )
+                hidden_states = outputs.last_hidden_state
+
+    def capture_codebook_cuda_graph(self, warmup_runs: int = 3):
+        """
+        Capture the full 31-step codebook generation loop as a CUDA graph.
+
+        All shapes are fixed (input [1,2,H], output [1,31]), enabling full
+        graph capture. Requires prepare_fast_weights() to have been called.
+
+        This is mutually exclusive with torch.compile(mode=reduce-overhead)
+        on model.forward — the two CUDA graph systems conflict.
+        """
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        num_codebooks = self.config.num_code_groups - 1
+
+        # Determine input embedding dim (before projection)
+        if isinstance(self.small_to_mtp_projection, torch.nn.Linear):
+            input_hidden_size = self.small_to_mtp_projection.in_features
+        else:
+            input_hidden_size = self.config.hidden_size
+
+        # Store constants for inner loop
+        self._cg_num_codebooks = num_codebooks
+        self._cg_temperature = 1.0
+        self._cg_top_k = min(50, self.config.vocab_size)
+
+        # Static buffers
+        self._cg_inputs_embeds = torch.randn(
+            1, 2, input_hidden_size, device=device, dtype=dtype
+        )
+        self._cg_output_tokens = torch.zeros(
+            1, num_codebooks, dtype=torch.long, device=device
+        )
+        self._cg_cache_positions = torch.arange(
+            0, 2 + num_codebooks, device=device, dtype=torch.long
+        )
+
+        # StaticCache for the graph (separate from the one in prepare_fast_weights)
+        max_cache_len = 2 + num_codebooks
+        self._cg_cache = StaticCache(
+            config=self.config,
+            max_batch_size=1,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Warmup runs
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(warmup_runs):
+                self._cg_cache.reset()
+                self._generate_fast_inner()
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        self._cg_graph = torch.cuda.CUDAGraph()
+        self._cg_cache.reset()
+        with torch.cuda.graph(self._cg_graph):
+            self._generate_fast_inner()
+
+        self._has_codebook_cuda_graph = True
+
     def enable_compile(self, mode: str = "reduce-overhead"):
         """
         Enable torch.compile for the code predictor model.
 
-        This compiles the inner model forward pass for faster execution.
+        Compiles the inner model forward pass for faster execution.
+        Also prepares stacked weights for generate_fast().
         Should be called once after model loading.
         """
+        self.prepare_fast_weights()
         self.model.forward = torch.compile(
             self.model.forward,
             mode=mode,
-            fullgraph=False,  # Allow graph breaks for flexibility
+            fullgraph=False,
         )
 
 
@@ -1907,7 +2077,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                     top_p=subtalker_top_p,
                     top_k=subtalker_top_k,
                     temperature=subtalker_temperature,
-                    output_hidden_states=True,
+                    output_hidden_states=False,
                     return_dict_in_generate=True,
                 )
                 codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
@@ -2099,8 +2269,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         use_compile: bool = True,
         use_cuda_graphs: bool = True,
         compile_mode: str = "reduce-overhead",
-        use_fast_codebook: bool = False,  # Disabled: needs debugging, currently slower
+        use_fast_codebook: bool = True,  # Fast codebook gen: bypasses HF generate() overhead
         compile_codebook_predictor: bool = True,
+        use_codebook_cuda_graph: bool = False,  # Manual CUDA graph for full codebook loop
+        capture_async_graph: bool = False,
     ):
         """
         Enable torch.compile and CUDA graphs optimizations for streaming decode.
@@ -2116,6 +2288,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             compile_mode: torch.compile mode ("reduce-overhead" recommended)
             use_fast_codebook: Use fast codebook generation (bypasses HF generate() overhead)
             compile_codebook_predictor: Apply torch.compile to codebook predictor (default True)
+            use_codebook_cuda_graph: Capture manual CUDA graph for the full 31-step codebook
+                                     loop. Mutually exclusive with compile_codebook_predictor
+                                     when compile_mode=reduce-overhead (both use CUDA graphs).
 
         Returns:
             self for method chaining
@@ -2133,6 +2308,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             use_compile=use_compile,
             use_cuda_graphs=use_cuda_graphs,
             compile_mode=compile_mode,
+            capture_async_graph=capture_async_graph,
         )
 
         # Enable fast codebook generation (bypasses HuggingFace generate() overhead)
@@ -2141,11 +2317,27 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             self.talker.enable_fast_codebook_gen(True)
 
         # Compile codebook predictor for faster inference
-        if compile_codebook_predictor and use_compile:
+        if compile_codebook_predictor and use_compile and not use_codebook_cuda_graph:
             print(f"[CodePredictor] Compiling model with mode={compile_mode}...")
             self.talker.code_predictor.enable_compile(mode=compile_mode)
+        elif use_codebook_cuda_graph:
+            # For manual CUDA graph: prepare weights only, no torch.compile
+            # torch.compile (even mode=default) conflicts with manual CUDA graph capture
+            # because dynamo guards fail inside the graph capture context
+            print("[CodePredictor] Preparing fast weights for CUDA graph capture...")
+            self.talker.code_predictor.prepare_fast_weights()
 
         return self
+
+    def capture_codebook_cuda_graph(self, warmup_runs: int = 3):
+        """
+        Capture CUDA graph for the codebook predictor's 31-step generation loop.
+        Call this after enable_streaming_optimizations(use_codebook_cuda_graph=True)
+        and after warmup (must be in the same thread context as inference).
+        """
+        print("[CodePredictor] Capturing CUDA graph for codebook generation...")
+        self.talker.code_predictor.capture_codebook_cuda_graph(warmup_runs=warmup_runs)
+        print("[CodePredictor] CUDA graph captured successfully")
 
     @classmethod
     def from_pretrained(

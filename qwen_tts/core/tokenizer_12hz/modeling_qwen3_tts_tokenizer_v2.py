@@ -1314,6 +1314,7 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
         use_compile: bool = True,
         use_cuda_graphs: bool = False,  # Changed default: not needed with reduce-overhead
         compile_mode: str = "reduce-overhead",
+        capture_async_graph: bool = False,
     ):
         """
         Enable optimizations for streaming decode.
@@ -1360,7 +1361,8 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
 
         # Capture async CUDA graph for decode on non-default streams
         # Uses private pool — safe for concurrent replay with reduce-overhead graphs
-        self.decoder.capture_async_cuda_graph(window_size=decode_window_frames)
+        if capture_async_graph:
+            self.decoder.capture_async_cuda_graph(window_size=decode_window_frames)
 
         return self
 

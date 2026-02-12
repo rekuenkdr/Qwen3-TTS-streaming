@@ -126,8 +126,10 @@ class Qwen3TTSModel:
         use_compile: bool = True,
         use_cuda_graphs: bool = True,
         compile_mode: str = "reduce-overhead",
-        use_fast_codebook: bool = False,  # Disabled: needs debugging, currently slower
+        use_fast_codebook: bool = False,
         compile_codebook_predictor: bool = True,
+        use_codebook_cuda_graph: bool = False,
+        capture_async_graph: bool = False,
     ):
         """
         Enable torch.compile and CUDA graphs optimizations for streaming decode.
@@ -147,8 +149,12 @@ class Qwen3TTSModel:
             compile_mode: torch.compile mode - "reduce-overhead" (recommended for streaming),
                           "max-autotune", or "default"
             use_fast_codebook: Use fast codebook generation that bypasses HuggingFace's
-                               generate() overhead (default True, ~2x faster per step)
-            compile_codebook_predictor: Apply torch.compile to codebook predictor (experimental)
+                               generate() overhead (~1.13x faster per step)
+            compile_codebook_predictor: Apply torch.compile to codebook predictor
+            use_codebook_cuda_graph: Capture manual CUDA graph for the full codebook loop.
+                                     Mutually exclusive with compile_codebook_predictor when
+                                     compile_mode=reduce-overhead (both use CUDA graphs).
+                                     Call capture_codebook_cuda_graph() after warmup.
 
         Returns:
             self for method chaining
@@ -168,8 +174,18 @@ class Qwen3TTSModel:
             compile_mode=compile_mode,
             use_fast_codebook=use_fast_codebook,
             compile_codebook_predictor=compile_codebook_predictor,
+            use_codebook_cuda_graph=use_codebook_cuda_graph,
+            capture_async_graph=capture_async_graph,
         )
         return self
+
+    def capture_codebook_cuda_graph(self, warmup_runs: int = 3):
+        """
+        Capture CUDA graph for the codebook predictor's generation loop.
+        Call after enable_streaming_optimizations(use_codebook_cuda_graph=True)
+        and after warmup passes (must be in the same thread context as inference).
+        """
+        self.model.capture_codebook_cuda_graph(warmup_runs=warmup_runs)
 
     def _supported_languages_set(self) -> Optional[set]:
         langs = getattr(self.model, "get_supported_languages", None)

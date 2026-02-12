@@ -416,6 +416,7 @@ class Qwen3TTSTokenizer:
         use_compile: bool = True,
         use_cuda_graphs: bool = True,
         compile_mode: str = "reduce-overhead",
+        capture_async_graph: bool = False,
     ):
         """
         Enable torch.compile and CUDA graphs optimizations for streaming decode.
@@ -425,6 +426,7 @@ class Qwen3TTSTokenizer:
             use_compile: Apply torch.compile to decoder
             use_cuda_graphs: Capture CUDA graphs for fixed-size operations
             compile_mode: torch.compile mode ("reduce-overhead" recommended for streaming)
+            capture_async_graph: Capture async CUDA graph for decode on non-default streams
 
         Returns:
             self for method chaining
@@ -439,6 +441,7 @@ class Qwen3TTSTokenizer:
             use_compile=use_compile,
             use_cuda_graphs=use_cuda_graphs,
             compile_mode=compile_mode,
+            capture_async_graph=capture_async_graph,
         )
 
     def decode_streaming(
