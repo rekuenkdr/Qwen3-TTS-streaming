@@ -11,10 +11,18 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 
 Added in this fork:
 - **Two-phase streaming** - faster first-chunk latency
-- **Async CUDA stream decoding (experimental)** - overlaps AR token generation with speech decoding on a separate CUDA stream. Disabled by default
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
 - **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
-- **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
+- **Repetition penalty for streaming** - prevents token loops that cause looping audio. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path.
+
+### Experimental (wip/experimental branch)
+
+- **`generate_fast()` codebook predictor** - bypasses HuggingFace `generate()` overhead for the 31-step autoregressive codebook loop. 1.13x faster per-frame in isolation
+- **Manual CUDA graph capture for codebook predictor** - captures the full 31-step codebook loop as a single CUDA graph replay. **2.15x faster** per-frame in isolation (12.94ms vs 27.88ms baseline)
+- **GPU-resident repetition penalty** - penalty computation on GPU without CPU roundtrip
+- **Batch streaming** - process multiple texts in a single batched transformer pass with `batch_stream_generate_voice_clone()`, with per-item state management and independent EOS detection
+- **Batch compaction** - removes finished items from GPU tensors mid-batch
+- **Async CUDA stream decoding** - overlaps AR generation with speech decoding on a separate CUDA stream (disabled by default, no speedup observed on single GPU)
 
 ## Installation
 
@@ -68,6 +76,46 @@ for chunk, sr in model.stream_generate_voice_clone(
     sd.wait()
 ```
 
+## Batch Streaming
+
+Generate audio for multiple texts in a single batched pass through the transformer. All items advance in lockstep, sharing the KV cache. A single voice prompt can be broadcast to all items, or you can pass one per item.
+
+```python
+import numpy as np
+import soundfile as sf
+
+# Batch of texts (same voice prompt broadcast to all)
+texts = [
+    "First sentence to synthesize.",
+    "Second sentence, different text.",
+    "Third sentence in the batch.",
+]
+
+# Accumulate per-item chunks
+item_chunks = [[] for _ in range(len(texts))]
+
+for chunks_list, sr in model.batch_stream_generate_voice_clone(
+    text=texts,
+    language="English",              # broadcast to all items
+    voice_clone_prompt=prompt,       # broadcast to all items
+    emit_every_frames=8,
+    decode_window_frames=80,
+    first_chunk_emit_every=5,
+    first_chunk_decode_window=48,
+    first_chunk_frames=48,
+):
+    for i, chunk in enumerate(chunks_list):
+        if chunk.size > 0:
+            item_chunks[i].append(chunk)
+
+# Save each item
+for i, chunks in enumerate(item_chunks):
+    if chunks:
+        sf.write(f"output_{i}.wav", np.concatenate(chunks), sr)
+```
+
+Items finish independently (per-item EOS detection), but the generator keeps yielding until all items are done. Finished items receive empty arrays.
+
 ## Streaming Parameters
 
 | Parameter | Default | Description |
@@ -110,6 +158,42 @@ User hears audio **362ms earlier** vs baseline, **174ms earlier** vs only optimi
 - vs Baseline: **2.75x faster** (570ms → 208ms, saves 362ms)
 - vs Optimized: **1.87x faster** (389ms → 208ms, saves 181ms)
 - vs Optimized_2: **1.84x faster** (382ms → 208ms, saves 174ms)
+
+## Codebook Predictor Optimization (Experimental)
+
+The codebook predictor runs 31 sequential autoregressive steps per codec frame (16 code groups - 1 = 15 decode steps after prefill). This is the single biggest per-frame bottleneck in streaming TTS. Three optimization levels were benchmarked using `examples/profile_talker.py`:
+
+### Microbenchmarks (per-frame, 1.7B model)
+
+| Method | Per-Frame | Per-Step | Speedup |
+|--------|-----------|----------|---------|
+| HF `generate()` (baseline) | 27.88ms | ~1.86ms | 1.0x |
+| HF `generate()` (no hidden_states) | 28.24ms | ~1.88ms | ~1.0x |
+| `generate_fast()` | 24.59ms | ~1.64ms | **1.13x** |
+| `generate_fast()` + stacked weights | 24.14ms | ~1.61ms | 1.16x |
+| **`generate_fast()` + CUDA graph** | **12.94ms** | **~0.86ms** | **2.15x** |
+| Single decode step (reference) | 1.51ms | 1.51ms | — |
+
+### Projected Inter-Chunk Latency (emit_every=12)
+
+| Method | 12 frames | Improvement |
+|--------|-----------|-------------|
+| HF `generate()` | ~335ms | baseline |
+| `generate_fast()` | ~295ms | -40ms |
+| CUDA graph | **~155ms** | **-180ms** |
+
+### What Each Level Does
+
+**`generate_fast()`** replaces HuggingFace's `generate()` with a tight loop that:
+- Skips GenerationMixin overhead (stopping criteria, output processing, etc.)
+- Uses StaticCache with pre-allocated KV buffers
+- Runs sampling inline (top-k + multinomial)
+- Eliminates per-step Python allocations
+
+**CUDA graph capture** (`capture_codebook_cuda_graph()`) records the full 31-step `generate_fast()` loop as a single CUDA graph:
+- Eliminates all CPU-to-GPU kernel launch overhead
+- One `graph.replay()` replaces 31 individual kernel launches
+- 2.15x speedup in isolation
 
 ## Async CUDA Stream Decoding (Experimental)
 
@@ -210,8 +294,20 @@ model.enable_streaming_optimizations(
 | `use_compile` | True | Apply torch.compile to decoder |
 | `use_cuda_graphs` | True | Capture CUDA graphs for fixed window |
 | `compile_mode` | "reduce-overhead" | torch.compile mode |
-| `use_fast_codebook` | False | Use fast codebook generation (experimental) |
+| `use_fast_codebook` | False | Use `generate_fast()` for codebook (experimental, 1.13x) |
 | `compile_codebook_predictor` | True | Apply torch.compile to codebook predictor |
+| `use_codebook_cuda_graph` | False | Manual CUDA graph for codebook (experimental, 2.15x isolated but conflicts with reduce-overhead) |
+
+## Profiling
+
+Run the codebook predictor microbenchmarks:
+
+```bash
+cd examples
+python profile_talker.py
+```
+
+Measures all codebook generation paths (HF generate, generate_fast, CUDA graph capture) and runs a torch.profiler trace over 5 streaming chunks.
 
 ---
 
