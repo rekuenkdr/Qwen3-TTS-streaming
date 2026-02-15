@@ -1658,6 +1658,9 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
             dtype=dtype,
         )
 
+        # Private pool isolates this graph from reduce-overhead's pool
+        self._cg_pool = torch.cuda.graph_pool_handle()
+
         # Warmup runs
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -1670,7 +1673,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         # Capture
         self._cg_graph = torch.cuda.CUDAGraph()
         self._cg_cache.reset()
-        with torch.cuda.graph(self._cg_graph):
+        with torch.cuda.graph(self._cg_graph, pool=self._cg_pool):
             self._generate_fast_inner()
 
         self._has_codebook_cuda_graph = True
