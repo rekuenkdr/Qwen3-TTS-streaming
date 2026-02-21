@@ -2261,6 +2261,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         self.post_init()
 
         self._decode_stream: Optional[torch.cuda.Stream] = None
+        self._paged_engine = None
 
     def _get_decode_stream(self) -> torch.cuda.Stream:
         """Lazy-initialize a CUDA stream for async speech decoding."""
@@ -2290,6 +2291,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         compile_codebook_predictor: bool = True,
         use_codebook_cuda_graph: bool = False,  # Manual CUDA graph for full codebook loop
         capture_async_graph: bool = False,
+        # Paged attention engine (opt-in alternative backend)
+        use_paged_engine: bool = False,
+        paged_gpu_memory_utilization: float = 0.3,
+        paged_enforce_eager: bool = False,
     ):
         """
         Enable torch.compile and CUDA graphs optimizations for streaming decode.
@@ -2344,7 +2349,41 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             print("[CodePredictor] Preparing fast weights for CUDA graph capture...")
             self.talker.code_predictor.prepare_fast_weights()
 
+        # Initialize paged attention engine if requested
+        if use_paged_engine:
+            self._init_paged_engine(
+                gpu_memory_utilization=paged_gpu_memory_utilization,
+                enforce_eager=paged_enforce_eager,
+            )
+
         return self
+
+    def _init_paged_engine(
+        self,
+        gpu_memory_utilization: float = 0.3,
+        enforce_eager: bool = False,
+    ):
+        """Lazy-initialize the paged attention engine."""
+        if self._paged_engine is not None:
+            return
+        from ..paged_engine import PagedEngine
+        print("[PagedEngine] Initializing paged attention engine...")
+        self._paged_engine = PagedEngine(
+            hf_model=self,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+        )
+        print("[PagedEngine] Paged engine initialized (call warmup_paged_engine() in worker thread)")
+
+    def warmup_paged_engine(self):
+        """Warmup the paged engine: allocate KV caches and capture CUDA graphs.
+
+        Must run in the same thread context as inference (CUDA graph TLS requirement).
+        In FastAPI, call via: await anyio.to_thread.run_sync(model.warmup_paged_engine)
+        """
+        if self._paged_engine is None:
+            raise ValueError("Paged engine not initialized. Call enable_streaming_optimizations(use_paged_engine=True) first.")
+        self._paged_engine.warmup()
 
     def capture_codebook_cuda_graph(self, warmup_runs: int = 3):
         """
@@ -2898,6 +2937,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         first_chunk_frames: int = 48,  # Switch to stable after this many frames
         # Async decode: overlap AR and speech decoder on separate CUDA streams
         async_decode: bool = False,
+        # Paged attention engine (opt-in alternative backend)
+        use_paged_engine: bool = False,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2928,6 +2969,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled, use emit_every_frames)
             first_chunk_decode_window: Decode window size for first chunk phase
             first_chunk_frames: Switch to stable settings after this many frames
+            use_paged_engine: Use paged attention engine instead of HF DynamicCache
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2943,6 +2985,36 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 speakers=speakers,
                 non_streaming_mode=non_streaming_mode,
             )
+
+        # Delegate to paged engine path if requested
+        if use_paged_engine:
+            yield from self._stream_generate_pcm_paged(
+                talker_input_embeds=talker_input_embeds,
+                talker_attention_mask=talker_attention_mask,
+                trailing_text_hiddens=trailing_text_hiddens,
+                tts_pad_embed=tts_pad_embed,
+                voice_clone_prompt=voice_clone_prompt,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                subtalker_dosample=subtalker_dosample,
+                subtalker_top_k=subtalker_top_k,
+                subtalker_top_p=subtalker_top_p,
+                subtalker_temperature=subtalker_temperature,
+                repetition_penalty=repetition_penalty,
+                repetition_penalty_window=repetition_penalty_window,
+                emit_every_frames=emit_every_frames,
+                decode_window_frames=decode_window_frames,
+                overlap_samples=overlap_samples,
+                max_frames=max_frames,
+                use_optimized_decode=use_optimized_decode,
+                first_chunk_emit_every=first_chunk_emit_every,
+                first_chunk_decode_window=first_chunk_decode_window,
+                first_chunk_frames=first_chunk_frames,
+                async_decode=async_decode,
+            )
+            return
 
         # Multiple EOS tokens that can terminate generation
         # Some models may emit different EOS tokens depending on context
@@ -3266,6 +3338,308 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             if decode_stream is not None:
                 torch.cuda.current_stream().wait_stream(decode_stream)
 
+
+    @torch.inference_mode()
+    def _stream_generate_pcm_paged(
+        self,
+        talker_input_embeds: torch.Tensor,
+        talker_attention_mask: torch.Tensor,
+        trailing_text_hiddens: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+        voice_clone_prompt: Optional[list[dict]] = None,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        repetition_penalty: float = 1.0,
+        repetition_penalty_window: int = 100,
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 512,
+        max_frames: int = 10000,
+        use_optimized_decode: bool = True,
+        first_chunk_emit_every: int = 0,
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,
+        async_decode: bool = False,
+    ) -> Generator[tuple[np.ndarray, int], None, None]:
+        """Paged attention path for stream_generate_pcm.
+
+        Same structure as the HF decode loop but uses self._paged_engine for
+        the talker forward + codebook generation. All downstream logic (codes_buffer,
+        two-phase emit, speech tokenizer decode, crossfade, flush) is identical.
+        """
+        engine = self._paged_engine
+        assert engine is not None, "Paged engine not initialized"
+
+        # EOS tokens
+        eos_ids = {
+            self.config.talker_config.codec_eos_token_id,
+            2150, 2157, 151670,
+            self.config.tts_eos_token_id,
+            self.config.im_end_token_id,
+            151643,
+        }
+        vocab_size = self.config.talker_config.vocab_size
+
+        # Prefill via paged engine
+        token, last_hidden, seq = engine.prefill(
+            talker_input_embeds=talker_input_embeds,
+            attention_mask=talker_attention_mask,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        # Extract ref_code for decoder context (if in ICL mode)
+        ref_code_context: Optional[torch.Tensor] = None
+        ref_code_frames: int = 0
+        if voice_clone_prompt is not None:
+            ref_code_list = voice_clone_prompt.get("ref_code", None)
+            icl_mode_list = voice_clone_prompt.get("icl_mode", None)
+            if ref_code_list is not None and icl_mode_list is not None:
+                if ref_code_list[0] is not None and icl_mode_list[0]:
+                    ref_code_context = ref_code_list[0].to(self.talker.device)
+                    ref_code_frames = ref_code_context.shape[0]
+
+        # Decode loop state
+        codes_buffer: list[torch.Tensor] = []
+        decoded_tail: Optional[np.ndarray] = None
+        frames_since_emit = 0
+        total_frames_emitted = 0
+
+        # Repetition penalty
+        if repetition_penalty != 1.0:
+            rp_window = repetition_penalty_window if repetition_penalty_window > 0 else max_frames
+            rp_history = torch.full((1, rp_window), vocab_size, device=token.device, dtype=torch.long)
+            rp_history[0, 0] = token[0]
+            rp_step = 1
+
+        # Pre-compute decode constants
+        samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
+        sample_rate = int(self.speech_tokenizer.model.get_output_sample_rate())
+
+        # Async decode setup
+        if async_decode and torch.cuda.is_available():
+            decode_stream = self._get_decode_stream()
+        else:
+            async_decode = False
+            decode_stream = None
+        pending_decode = None
+
+        # Build first input_embeds for decode from the prefill token
+        # The first token needs codec embedding + text conditioning
+        first_codec_embed = engine.paged_talker.get_input_embeddings()(token)
+        # For the first step, we need generation_step = 0
+        generation_step = 0
+        if generation_step < trailing_text_hiddens.shape[1]:
+            next_input = first_codec_embed.unsqueeze(1) + trailing_text_hiddens[:, generation_step:generation_step+1, :]
+        else:
+            next_input = first_codec_embed.unsqueeze(1) + tts_pad_embed
+
+        try:
+            for step_idx in range(max_frames):
+                # Check pending async decode
+                if pending_decode is not None:
+                    event, result = pending_decode
+                    if event.query():
+                        event.synchronize()
+                        wav = result['wav_gpu'][0].to(torch.float32).detach().cpu().numpy()
+                        chunk, decoded_tail = self._postprocess_chunk(
+                            wav, result['emit_every'], samples_per_frame,
+                            decoded_tail, overlap_samples,
+                        )
+                        total_frames_emitted = result['buffer_len']
+                        pending_decode = None
+                        yield chunk, sample_rate
+
+                # Paged engine step: talker decode + codebook generation
+                next_token, codec_ids, step_logits = engine.step(
+                    seq=seq,
+                    input_embeds=next_input,
+                    temperature=temperature,
+                    top_k=top_k,
+                    subtalker_temperature=subtalker_temperature,
+                    subtalker_top_k=subtalker_top_k,
+                )
+
+                generation_step += 1
+
+                # Check for EOS
+                if codec_ids[0, 0].item() in eos_ids:
+                    break
+
+                codes_buffer.append(codec_ids[0].detach())
+
+                # Apply repetition penalty
+                step_logits_2d = step_logits[:, -1, :] if step_logits.dim() == 3 else step_logits
+                if repetition_penalty != 1.0:
+                    presence = torch.zeros(1, vocab_size + 1, device=step_logits_2d.device, dtype=torch.bool)
+                    presence.scatter_(1, rp_history, True)
+                    penalty_mask = presence[:, :vocab_size]
+                    penalized = torch.where(
+                        step_logits_2d > 0,
+                        step_logits_2d / repetition_penalty,
+                        step_logits_2d * repetition_penalty,
+                    )
+                    step_logits_2d = torch.where(penalty_mask, penalized, step_logits_2d)
+
+                token = next_token
+
+                if repetition_penalty != 1.0:
+                    pos = rp_step % rp_window
+                    rp_history[0, pos] = token[0]
+                    rp_step += 1
+
+                # Build next input_embeds from codec_ids + text conditioning
+                # Slice trailing_text_hiddens to single step [1,1,hidden] to avoid broadcast blow-up
+                if generation_step < trailing_text_hiddens.shape[1]:
+                    text_cond = trailing_text_hiddens[:, generation_step:generation_step+1, :]
+                    pad_cond = torch.zeros_like(tts_pad_embed.squeeze(1))
+                else:
+                    text_cond = torch.zeros_like(trailing_text_hiddens[:, 0:1, :])
+                    pad_cond = tts_pad_embed.squeeze(1)
+                next_input = engine.build_next_input_embeds(
+                    codec_ids=codec_ids,
+                    trailing_text_hiddens=text_cond,
+                    tts_pad_embed=pad_cond,
+                    generation_step=generation_step,
+                )
+
+                frames_since_emit += 1
+
+                # Two-phase streaming
+                total_frames_generated = len(codes_buffer)
+                if first_chunk_emit_every > 0 and total_frames_generated < first_chunk_frames:
+                    current_emit_every = first_chunk_emit_every
+                    current_decode_window = first_chunk_decode_window
+                    current_use_optimized = False
+                else:
+                    current_emit_every = emit_every_frames
+                    current_decode_window = decode_window_frames
+                    current_use_optimized = use_optimized_decode
+
+                if frames_since_emit < current_emit_every:
+                    continue
+                frames_since_emit = 0
+
+                # Decode window
+                start = max(0, len(codes_buffer) - current_decode_window)
+                window_codes = torch.stack(codes_buffer[start:], dim=0)
+
+                window, _ = _add_ref_code_context(
+                    window_codes, ref_code_context, ref_code_frames, current_decode_window
+                )
+
+                if async_decode:
+                    if pending_decode is not None:
+                        p_event, p_result = pending_decode
+                        p_event.synchronize()
+                        wav = p_result['wav_gpu'][0].to(torch.float32).detach().cpu().numpy()
+                        chunk, decoded_tail = self._postprocess_chunk(
+                            wav, p_result['emit_every'], samples_per_frame,
+                            decoded_tail, overlap_samples,
+                        )
+                        total_frames_emitted = p_result['buffer_len']
+                        pending_decode = None
+                        yield chunk, sample_rate
+
+                    codes_batched = window.unsqueeze(0).to(self.talker.device).clone()
+                    input_ready = torch.cuda.Event()
+                    input_ready.record()
+                    codes_batched.record_stream(decode_stream)
+
+                    decode_stream.wait_event(input_ready)
+                    with torch.cuda.stream(decode_stream):
+                        wav_gpu = self.speech_tokenizer.model.decode_streaming(
+                            codes_batched,
+                            use_async_graph=True,
+                            pad_to_size=decode_window_frames,
+                        ).clone()
+
+                    decode_done = torch.cuda.Event()
+                    decode_done.record(decode_stream)
+                    pending_decode = (decode_done, {
+                        'wav_gpu': wav_gpu,
+                        'emit_every': current_emit_every,
+                        'buffer_len': len(codes_buffer),
+                    })
+                else:
+                    if current_use_optimized and hasattr(self.speech_tokenizer, 'decode_streaming'):
+                        wavs, sr = self.speech_tokenizer.decode_streaming(
+                            window.to(self.talker.device),
+                            use_optimized=True,
+                            pad_to_size=decode_window_frames,
+                        )
+                    else:
+                        wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+
+                    wav = wavs[0].astype(np.float32)
+                    chunk, decoded_tail = self._postprocess_chunk(
+                        wav, current_emit_every, samples_per_frame,
+                        decoded_tail, overlap_samples,
+                    )
+                    total_frames_emitted = len(codes_buffer)
+                    yield chunk, sr
+
+            # Drain pending async decode
+            if pending_decode is not None:
+                p_event, p_result = pending_decode
+                p_event.synchronize()
+                wav = p_result['wav_gpu'][0].to(torch.float32).detach().cpu().numpy()
+                chunk, decoded_tail = self._postprocess_chunk(
+                    wav, p_result['emit_every'], samples_per_frame,
+                    decoded_tail, overlap_samples,
+                )
+                total_frames_emitted = p_result['buffer_len']
+                pending_decode = None
+                yield chunk, sample_rate
+
+            # Flush remaining frames
+            remaining_frames = len(codes_buffer) - total_frames_emitted
+            if remaining_frames > 0:
+                context_frames = min(total_frames_emitted, decode_window_frames - remaining_frames)
+                start_idx = total_frames_emitted - context_frames
+                window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
+
+                window, flush_ref_prefix_frames = _add_ref_code_context(
+                    window_codes, ref_code_context, ref_code_frames, decode_window_frames
+                )
+
+                wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+                wav = wavs[0].astype(np.float32)
+
+                skip_frames = flush_ref_prefix_frames + context_frames
+                if skip_frames > 0:
+                    flush_spf = len(wav) / window.shape[0]
+                    skip_samples = int(skip_frames * flush_spf)
+                    wav = wav[skip_samples:]
+
+                blend_samples = overlap_samples
+                if decoded_tail is not None and len(wav) > 0:
+                    ov = min(blend_samples, len(decoded_tail), len(wav))
+                    if ov > 0:
+                        head = _crossfade(decoded_tail[-ov:], wav[:ov])
+                        wav = np.concatenate([head, wav[ov:]], axis=0)
+
+                if blend_samples > 0 and len(wav) > blend_samples:
+                    fade_len = min(blend_samples, len(wav))
+                    t = np.arange(fade_len, dtype=np.float32) / max(fade_len - 1, 1)
+                    fade_out = 0.5 * (1 + np.cos(np.pi * t))
+                    wav[-fade_len:] *= fade_out
+
+                yield wav, sr
+
+        finally:
+            # Cleanup paged engine sequence
+            engine.cleanup(seq)
+            if pending_decode is not None:
+                pending_decode[0].synchronize()
+            if decode_stream is not None:
+                torch.cuda.current_stream().wait_stream(decode_stream)
 
     @torch.inference_mode()
     def batch_stream_generate_pcm(

@@ -130,6 +130,9 @@ class Qwen3TTSModel:
         compile_codebook_predictor: bool = True,
         use_codebook_cuda_graph: bool = False,
         capture_async_graph: bool = False,
+        use_paged_engine: bool = False,
+        paged_gpu_memory_utilization: float = 0.3,
+        paged_enforce_eager: bool = False,
     ):
         """
         Enable torch.compile and CUDA graphs optimizations for streaming decode.
@@ -155,6 +158,10 @@ class Qwen3TTSModel:
                                      Mutually exclusive with compile_codebook_predictor when
                                      compile_mode=reduce-overhead (both use CUDA graphs).
                                      Call capture_codebook_cuda_graph() after warmup.
+            use_paged_engine: Use paged attention engine instead of HF-based inference.
+                              Requires flash-attn, triton, and xxhash.
+            paged_gpu_memory_utilization: Fraction of GPU memory for paged KV cache.
+            paged_enforce_eager: Skip CUDA graph capture in paged engine (debug mode).
 
         Returns:
             self for method chaining
@@ -176,6 +183,9 @@ class Qwen3TTSModel:
             compile_codebook_predictor=compile_codebook_predictor,
             use_codebook_cuda_graph=use_codebook_cuda_graph,
             capture_async_graph=capture_async_graph,
+            use_paged_engine=use_paged_engine,
+            paged_gpu_memory_utilization=paged_gpu_memory_utilization,
+            paged_enforce_eager=paged_enforce_eager,
         )
         return self
 
@@ -726,6 +736,8 @@ class Qwen3TTSModel:
         repetition_penalty: float = 1.0,
         # Async decode: overlap AR generation with speech decoding on separate CUDA streams
         async_decode: bool = False,
+        # Paged attention engine
+        use_paged_engine: bool = False,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -840,6 +852,7 @@ class Qwen3TTSModel:
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
             async_decode=async_decode,
+            use_paged_engine=use_paged_engine,
             **gen_kwargs,
         ):
             yield chunk, sr
