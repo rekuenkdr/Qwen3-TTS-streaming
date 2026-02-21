@@ -257,6 +257,13 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+        if self.rope_type == "default" and "default" not in ROPE_INIT_FUNCTIONS:
+            if "linear" in ROPE_INIT_FUNCTIONS:
+                self.rope_type = "linear"
+                if self.config.rope_scaling is None:
+                    self.config.rope_scaling = {"type": "linear", "factor": 1.0}
+                elif isinstance(self.config.rope_scaling, dict) and "factor" not in self.config.rope_scaling:
+                    self.config.rope_scaling["factor"] = 1.0
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)

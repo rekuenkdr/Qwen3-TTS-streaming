@@ -76,6 +76,7 @@ class Qwen3TTSTokenizerV2DecoderConfig(PretrainedConfig):
         latent_dim=1024,
         max_position_embeddings=8000,
         rope_theta=10000,
+        rope_scaling=None,
         num_attention_heads=16,
         num_key_value_heads=16,
         attention_bias=False,
@@ -98,6 +99,7 @@ class Qwen3TTSTokenizerV2DecoderConfig(PretrainedConfig):
         self.latent_dim = latent_dim
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.attention_bias = attention_bias

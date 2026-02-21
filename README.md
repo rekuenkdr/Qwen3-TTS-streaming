@@ -23,6 +23,7 @@ Added in this fork:
 - **Batch streaming** - process multiple texts in a single batched transformer pass with `batch_stream_generate_voice_clone()`, with per-item state management and independent EOS detection
 - **Batch compaction** - removes finished items from GPU tensors mid-batch
 - **Async CUDA stream decoding** - overlaps AR generation with speech decoding on a separate CUDA stream (disabled by default, no speedup observed on single GPU)
+- **Paged attention engine** — opt-in alternative backend using flash-attn with paged KV cache, prefix caching via content hashing, and CUDA graph capture for decode steps
 
 ## Installation
 
@@ -227,7 +228,63 @@ With async_decode=True (pipelined):
   Output:               chunk 1      chunk 2      ...
 ```
 
+## Paged Attention Engine (Experimental)
 
+A vLLM-inspired paged attention backend that replaces HuggingFace's DynamicCache for streaming inference. Uses flash-attn for both prefill (`flash_attn_varlen_func`) and decode (`flash_attn_with_kvcache`), a paged KV cache with 256-token blocks, prefix caching via xxhash content hashing, and CUDA graph capture for decode steps.
+
+```
+PagedEngine
+├── ModelRunner (prefill/decode, CUDA graph capture/replay)
+│   ├── PagedTalker (weight-sharing wrapper, PagedDecoderLayer)
+│   └── PagedPredictor (weight-sharing wrapper, 15 codebooks)
+├── TalkerScheduler / PredictorScheduler (continuous batching)
+├── BlockManager (paged KV allocation, prefix hash cache)
+└── AttentionContext (thread-local per-forward metadata)
+```
+
+### Usage
+
+```python
+# Enable with paged engine
+model.enable_streaming_optimizations(use_paged_engine=True)
+
+# Warm up CUDA graphs for decode (recommended)
+model.warmup_paged_engine()
+
+# Stream as usual — paged engine is used automatically
+for chunk, sr in model.stream_generate_voice_clone(
+    text="Hello, streaming with paged attention!",
+    language="en",
+    voice_clone_prompt=prompt,
+    use_paged_engine=True,
+):
+    sd.play(chunk, sr)
+    sd.wait()
+```
+
+### Key Features
+
+- Flash-attn paged attention (varlen prefill + kvcache decode)
+- 256-token block KV cache with ref-counted prefix caching (xxhash)
+- CUDA graph capture for decode at batch sizes [1, 2, 4, 8, ...]
+- Weight sharing — no model copies, wraps existing HF weights
+- Thread-safe scheduling (threading.Lock for FastAPI)
+
+### Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_paged_engine` | False | Enable paged attention backend |
+| `paged_gpu_memory_utilization` | 0.3 | Fraction of GPU VRAM for KV cache |
+| `paged_enforce_eager` | False | Skip CUDA graph capture (debug) |
+
+### Dependencies
+
+Requires `flash-attn`, `triton`, and `xxhash` (not installed by default):
+
+```bash
+pip install flash-attn triton xxhash
+```
 
 ## Audio Quality Fixes
 
@@ -297,6 +354,9 @@ model.enable_streaming_optimizations(
 | `use_fast_codebook` | False | Use `generate_fast()` for codebook (experimental, 1.13x) |
 | `compile_codebook_predictor` | True | Apply torch.compile to codebook predictor |
 | `use_codebook_cuda_graph` | False | Manual CUDA graph for codebook (experimental, 2.15x isolated but conflicts with reduce-overhead) |
+| `use_paged_engine` | False | Enable paged attention backend (experimental, requires flash-attn) |
+| `paged_gpu_memory_utilization` | 0.3 | Fraction of GPU VRAM allocated for paged KV cache |
+| `paged_enforce_eager` | False | Skip CUDA graph capture for paged engine (debug) |
 
 ## Profiling
 
@@ -314,3 +374,4 @@ Measures all codebook generation paths (HF generate, generate_fast, CUDA graph c
 Based on:
 - [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
 - [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streaming)
+- [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) (paged attention engine reference)
