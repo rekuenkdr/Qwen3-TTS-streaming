@@ -55,7 +55,9 @@ class Qwen3TTSSpeakerEncoderConfig(PretrainedConfig):
         enc_res2net_scale=8,
         enc_se_channels=128,
         sample_rate=24000,
+        **kwargs,
     ):
+        super().__init__(**kwargs)
         self.mel_dim = mel_dim
         self.enc_dim = enc_dim
         self.enc_channels = enc_channels
@@ -400,12 +402,15 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         spk_id=None,
         spk_is_dialect=None,
         codec_language_id=None,
+        pad_token_id=None,
         **kwargs,
     ):
         super().__init__(
+            pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        self.pad_token_id = pad_token_id
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
